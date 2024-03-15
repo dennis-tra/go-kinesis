@@ -56,14 +56,9 @@ func (a *aggregator) drain() (*dataRecord, error) {
 		return nil, ErrNoRecordsToDrain
 	}
 
-	kclData, err := a.aggregate()
+	rec, err := a.aggregate()
 	if err != nil {
 		return nil, err
-	}
-
-	rec, err := newDataRecord(a.keys[0], nil, kclData)
-	if err != nil {
-		return nil, fmt.Errorf("new data record: %w", err)
 	}
 
 	a.aggSize = baseAggRecordSize
@@ -75,10 +70,12 @@ func (a *aggregator) drain() (*dataRecord, error) {
 	return rec, nil
 }
 
-func (a *aggregator) aggregate() ([]byte, error) {
+func (a *aggregator) aggregate() (*dataRecord, error) {
 	records := make([]*pb.Record, len(a.buf))
+	urecs := make([]Record, len(a.buf))
 	for i, rec := range a.buf {
 		keyIndex := uint64(a.keysIdx[rec.pk])
+		urecs[i] = a.buf[i]
 		records[i] = &pb.Record{
 			Data:              rec.data,
 			PartitionKeyIndex: &keyIndex,
@@ -102,7 +99,12 @@ func (a *aggregator) aggregate() ([]byte, error) {
 	kclData := append(magicBytes, pbData...)
 	kclData = append(kclData, checksum...)
 
-	return kclData, nil
+	aggRec, err := newDataRecord(a.keys[0], nil, kclData, urecs...)
+	if err != nil {
+		return nil, fmt.Errorf("new data record: %w", err)
+	}
+
+	return aggRec, nil
 }
 
 func (a *aggregator) put(record *dataRecord) {

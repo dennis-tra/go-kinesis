@@ -3,10 +3,10 @@ package kinesis
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"math/big"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,6 +16,7 @@ import (
 	"github.com/benbjohnson/clock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/goleak"
 	"go.uber.org/mock/gomock"
 )
 
@@ -60,7 +61,6 @@ func testConfig() (*ProducerConfig, *clock.Mock) {
 	cfg := DefaultProducerConfig()
 	clk := clock.NewMock()
 	cfg.clock = clk
-	cfg.Log = slog.Default()
 	return cfg, clk
 }
 
@@ -69,23 +69,45 @@ func testConfig() (*ProducerConfig, *clock.Mock) {
 // the end of the test. Being ready means that the listShards API was made and
 // that the infinite loop is reached.
 func startProducer(t *testing.T, ctx context.Context, p *Producer) {
+	t.Helper()
+
+	// configure mock calls
+	p.client.(*MockClient).EXPECT().ListShards(gomock.Any(), gomock.Any()).Times(1).Return(singleShardResponse(), nil)
+
 	// start the producer
-	stopped := make(chan struct{})
 	producerCtx, stopProducer := context.WithCancel(ctx)
 	go func() {
 		err := p.Start(producerCtx)
 		require.NoError(t, err)
-		close(stopped)
 	}()
 
 	t.Cleanup(func() {
-		// stop the producer and wait until it's done
 		stopProducer()
-		assertClosed(t, ctx, stopped)
+		assertClosed(t, ctx, p.stopped)
+		goleak.VerifyNone(t)
 	})
+	// wait until idle
+	assert.NoError(t, p.WaitIdle(ctx))
+}
 
-	// wait until it's actually ready
-	assertClosed(t, ctx, p.readyChan)
+func mustNewDataRecord(t *testing.T, partitionKey string, data []byte) *dataRecord {
+	rec, err := newDataRecord(partitionKey, nil, data)
+	require.NoError(t, err)
+	return rec
+}
+
+func singleShardResponse() *kinesis.ListShardsOutput {
+	return &kinesis.ListShardsOutput{
+		Shards: []types.Shard{
+			{
+				HashKeyRange: &types.HashKeyRange{
+					StartingHashKey: aws.String(big.NewInt(0).String()),
+					EndingHashKey:   aws.String(maxInt128.String()),
+				},
+				ShardId: aws.String("shard-0"),
+			},
+		},
+	}
 }
 
 func TestProducer_NewProducer(t *testing.T) {
@@ -106,7 +128,10 @@ func TestProducer_NewProducer(t *testing.T) {
 	assert.NotNil(t, p.flushJobs)
 	assert.NotNil(t, p.flushResults)
 	assert.NotNil(t, p.flushTicker)
-	assert.NotNil(t, p.readyChan)
+	assert.NotNil(t, p.idleWaiters)
+	assert.NotNil(t, p.newIdleWaiter)
+	assert.Equal(t, int32(producerStateUnstarted), p.state.Load())
+	assert.NotNil(t, p.stopped)
 	assert.NotNil(t, p.meterFlushCount)
 	assert.NotNil(t, p.meterFlushBytes)
 }
@@ -117,22 +142,34 @@ func TestProducer_Start_stop(t *testing.T) {
 	p, err := NewProducer(client, "test-stream", DefaultProducerConfig())
 	require.NoError(t, err)
 
+	startProducer(t, ctx, p)
+}
+
+func TestProducer_WaitIdle(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	ctx := testCtx(t)
+	client := NewMockClient(gomock.NewController(t))
+	cfg := DefaultProducerConfig()
+
+	p, err := NewProducer(client, "test-stream", cfg)
+	require.NoError(t, err)
+
 	// configure mock calls
 	client.EXPECT().ListShards(gomock.Any(), gomock.Any()).Times(1).Return(singleShardResponse(), nil)
 
-	stopped := make(chan struct{})
 	producerCtx, stopProducer := context.WithCancel(ctx)
 	go func() {
 		err := p.Start(producerCtx)
 		require.NoError(t, err)
-		close(stopped)
 	}()
-	err = p.Ready(ctx)
+
+	err = p.WaitIdle(ctx)
 	require.NoError(t, err)
 
 	stopProducer()
 
-	assertClosed(t, ctx, stopped)
+	assert.NoError(t, p.WaitStopped(ctx))
 
 	err = p.Put(ctx, "A", nil)
 	assert.ErrorIs(t, err, ErrProducerStopped)
@@ -170,45 +207,27 @@ func TestProducer_NewProducer_validation(t *testing.T) {
 func TestProducer_Put_inputValidation(t *testing.T) {
 	ctx := testCtx(t)
 	client := NewMockClient(gomock.NewController(t))
-	k, err := NewProducer(client, "test-stream", DefaultProducerConfig())
+	p, err := NewProducer(client, "test-stream", DefaultProducerConfig())
 	require.NoError(t, err)
+
+	startProducer(t, ctx, p)
 
 	t.Run("max_record_size_exceeded", func(t *testing.T) {
 		data := make([]byte, maxRecordSize+1)
-		err := k.Put(ctx, "partition-key", data)
+		err := p.Put(ctx, "partition-key", data)
 		assert.ErrorIs(t, ErrRecordSizeExceeded, err)
 	})
 
 	t.Run("no_partition_key", func(t *testing.T) {
-		err := k.Put(ctx, "", make([]byte, 1))
+		err := p.Put(ctx, "", make([]byte, 1))
 		assert.ErrorIs(t, ErrInvalidPartitionKey, err)
 	})
 
 	t.Run("too_long_partition_key", func(t *testing.T) {
 		key := strings.Repeat("X", maxPartitionKeyLength+1)
-		err := k.Put(ctx, key, make([]byte, 1))
+		err := p.Put(ctx, key, make([]byte, 1))
 		assert.ErrorIs(t, ErrInvalidPartitionKey, err)
 	})
-}
-
-func mustNewDataRecord(t *testing.T, partitionKey string, data []byte) *dataRecord {
-	rec, err := newDataRecord(partitionKey, nil, data)
-	require.NoError(t, err)
-	return rec
-}
-
-func singleShardResponse() *kinesis.ListShardsOutput {
-	return &kinesis.ListShardsOutput{
-		Shards: []types.Shard{
-			{
-				HashKeyRange: &types.HashKeyRange{
-					StartingHashKey: aws.String(big.NewInt(0).String()),
-					EndingHashKey:   aws.String(maxInt128.String()),
-				},
-				ShardId: aws.String("shard-0"),
-			},
-		},
-	}
 }
 
 func TestProducer_Put_collectRecord_flush(t *testing.T) {
@@ -225,9 +244,6 @@ func TestProducer_Put_collectRecord_flush(t *testing.T) {
 		mustNewDataRecord(t, "partition-key-2", []byte("data-2")),
 		mustNewDataRecord(t, "partition-key-3", []byte("data-3")),
 	}
-
-	// configure mock calls
-	client.EXPECT().ListShards(gomock.Any(), gomock.Any()).Times(1).Return(singleShardResponse(), nil)
 
 	done := make(chan struct{})
 	client.EXPECT().PutRecords(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(func(ctx context.Context, params *kinesis.PutRecordsInput, optFns ...func(*kinesis.Options)) (*kinesis.PutRecordsOutput, error) {
@@ -260,7 +276,7 @@ func TestProducer_Put_collectRecord_flush(t *testing.T) {
 		// assert accounting
 		assert.Len(t, p.collBuf, prevCollBufLen+1)
 		assert.Equal(t, p.collSize, prevCollSize+rec.Size())
-		assert.Equal(t, p.shards[0].nBytes, prevCollSize+rec.Size())
+		assert.Equal(t, p.shards[0].size, prevCollSize+rec.Size())
 		assert.Equal(t, p.shards[0].count, prevCollBufLen+1)
 	}
 
@@ -286,9 +302,6 @@ func TestProducer_Put_collectRecord_collectionMaxSizeExceeded(t *testing.T) {
 	client := NewMockClient(gomock.NewController(t))
 	p, err := NewProducer(client, "test-stream", cfg)
 	require.NoError(t, err)
-
-	// configure mock calls
-	client.EXPECT().ListShards(gomock.Any(), gomock.Any()).Times(1).Return(singleShardResponse(), nil)
 
 	// start the producer run loop
 	startProducer(t, ctx, p)
@@ -325,9 +338,6 @@ func TestProducer_Put_collectRecord_collectionMaxCountExceeded(t *testing.T) {
 	client := NewMockClient(gomock.NewController(t))
 	p, err := NewProducer(client, "test-stream", cfg)
 	require.NoError(t, err)
-
-	// configure mock calls
-	client.EXPECT().ListShards(gomock.Any(), gomock.Any()).Times(1).Return(singleShardResponse(), nil)
 
 	// start the producer run loop
 	startProducer(t, ctx, p)
@@ -411,7 +421,54 @@ func TestProducer_listShards(t *testing.T) {
 	}
 }
 
-func TestProducer_notifiee_droppedRecords(t *testing.T) {
+func TestProducer_notifiee_droppedRecords_collRec(t *testing.T) {
+	ctx := testCtx(t)
+	client := NewMockClient(gomock.NewController(t))
+	cfg, clk := testConfig()
+	cfg.AggregateMaxSize = 0
+
+	dropped := make(chan Record)
+	cfg.Notifiee = &NotifieeBundle{
+		DroppedRecordF: func(record Record) {
+			dropped <- record
+			close(dropped)
+		},
+	}
+	p, err := NewProducer(client, "test-stream", cfg)
+	require.NoError(t, err)
+	testErr := fmt.Errorf("test error")
+
+	var wg sync.WaitGroup
+	client.EXPECT().PutRecords(gomock.Any(), gomock.Any()).Times(cfg.RetryLimit).DoAndReturn(func(ctx context.Context, params *kinesis.PutRecordsInput, optFns ...func(*kinesis.Options)) (*kinesis.PutRecordsOutput, error) {
+		wg.Done()
+		return nil, testErr
+	})
+
+	// start the producer run loop
+	startProducer(t, ctx, p)
+
+	testRec := &testRecord{
+		dataRecord: mustNewDataRecord(t, "1", []byte("a")),
+		payload:    "payload",
+	}
+
+	err = p.PutRecord(ctx, testRec)
+	require.NoError(t, err)
+
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		clk.Add(cfg.FlushInterval)
+		wg.Wait()
+	}
+
+	rec := <-dropped
+	require.NotNil(t, rec)
+	got, ok := rec.(*testRecord)
+	assert.True(t, ok)
+	assert.Equal(t, testRec.payload, got.payload)
+}
+
+func TestProducer_notifiee_droppedRecords_aggRec(t *testing.T) {
 	ctx := testCtx(t)
 	client := NewMockClient(gomock.NewController(t))
 	cfg, clk := testConfig()
@@ -427,32 +484,35 @@ func TestProducer_notifiee_droppedRecords(t *testing.T) {
 	require.NoError(t, err)
 	testErr := fmt.Errorf("test error")
 
-	// configure mock calls
-	client.EXPECT().ListShards(gomock.Any(), gomock.Any()).Times(1).Return(singleShardResponse(), nil)
-
+	var wg sync.WaitGroup
 	client.EXPECT().PutRecords(gomock.Any(), gomock.Any()).Times(cfg.RetryLimit).DoAndReturn(func(ctx context.Context, params *kinesis.PutRecordsInput, optFns ...func(*kinesis.Options)) (*kinesis.PutRecordsOutput, error) {
+		wg.Done()
 		return nil, testErr
 	})
 
 	// start the producer run loop
 	startProducer(t, ctx, p)
 
-	err = p.PutRecord(ctx, mustNewDataRecord(t, "1", []byte("a")))
+	testRec := &testRecord{
+		dataRecord: mustNewDataRecord(t, "1", []byte("a")),
+		payload:    "payload",
+	}
+
+	err = p.PutRecord(ctx, testRec)
 	require.NoError(t, err)
 
 	clk.Add(cfg.FlushInterval)
-	time.Sleep(10 * time.Millisecond)
-
-	clk.Add(cfg.FlushInterval)
-	time.Sleep(10 * time.Millisecond)
-
-	clk.Add(cfg.FlushInterval)
-	time.Sleep(10 * time.Millisecond)
-
-	clk.Add(cfg.FlushInterval)
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		clk.Add(cfg.FlushInterval)
+		wg.Wait()
+	}
 
 	rec := <-dropped
 	require.NotNil(t, rec)
+	got, ok := rec.(*testRecord)
+	assert.True(t, ok)
+	assert.Equal(t, testRec.payload, got.payload)
 }
 
 func TestProducer_listShards_sortsShards(t *testing.T) {
@@ -466,6 +526,7 @@ func TestProducer_listShards_sortsShards(t *testing.T) {
 	// out of order shards
 	mockShards := []types.Shard{
 		{
+			ShardId: aws.String("shard-1"),
 			HashKeyRange: &types.HashKeyRange{
 				StartingHashKey: aws.String("2"),
 				EndingHashKey:   aws.String("3"),
@@ -473,6 +534,7 @@ func TestProducer_listShards_sortsShards(t *testing.T) {
 			SequenceNumberRange: &types.SequenceNumberRange{},
 		},
 		{
+			ShardId: aws.String("shard-0"),
 			HashKeyRange: &types.HashKeyRange{
 				StartingHashKey: aws.String("0"),
 				EndingHashKey:   aws.String("1"),
@@ -625,4 +687,8 @@ func TestProducer_aggRecord_aggregateMaxCount(t *testing.T) {
 
 	// assert that the aggregator has reset itself and added the latest record
 	assert.Len(t, p.shards[0].aggregator.buf, 0)
+}
+
+func TestProducer_handleNewShards(t *testing.T) {
+	t.Skipf("TODO")
 }

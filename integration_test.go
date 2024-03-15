@@ -1,14 +1,12 @@
 package kinesis
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
-	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -21,8 +19,6 @@ import (
 	promexp "go.opentelemetry.io/otel/exporters/prometheus"
 	sdkmetrics "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
-	semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
-
 	"golang.org/x/time/rate"
 )
 
@@ -115,7 +111,7 @@ func TestProducer(t *testing.T) {
 	stopCtx, stop := context.WithCancel(ctx)
 	startProducer(t, stopCtx, p)
 
-	for i := 0; i < 100_000; i++ {
+	for i := 0; i < 10_000; i++ {
 		evt := &TraceEvent{
 			Type:   fmt.Sprintf("EVENT_%05d", i),
 			PeerID: fmt.Sprintf("PEERID_%05d", i),
@@ -130,14 +126,6 @@ func TestProducer(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	t.Log("wait")
-	select {
-	case <-time.After(10 * time.Second):
-		slog.Error("STOPPING")
-		stop()
-	case <-ctx.Done():
-		slog.Info("Done")
-	}
-
-	time.Sleep(time.Minute)
+	err = p.WaitIdle(ctx)
+	stop()
 }

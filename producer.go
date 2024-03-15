@@ -21,7 +21,34 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// Producer is TODO
+type producerState int32
+
+const (
+	producerStateUnstarted producerState = 0
+	producerStateStarting  producerState = 1
+	producerStateStarted   producerState = 2
+	producerStateStopping  producerState = 3
+	producerStateStopped   producerState = 4
+)
+
+func (p producerState) String() string {
+	switch p {
+	case producerStateUnstarted:
+		return "unstarted"
+	case producerStateStarting:
+		return "starting"
+	case producerStateStarted:
+		return "started"
+	case producerStateStopping:
+		return "stopping"
+	case producerStateStopped:
+		return "stopped"
+	default:
+		return fmt.Sprintf("unknown state %d", p)
+	}
+}
+
+// Producer is batches records for efficient transmission to a Kinesis Data Stream.
 type Producer struct {
 	// reference the producer's configuration
 	cfg *ProducerConfig
@@ -65,14 +92,26 @@ type Producer struct {
 	// trigger a flush is exceeded.
 	flushTicker *clock.Ticker
 
+	// aggTicker triggers draining shard aggregator
+	aggTicker *clock.Ticker
+
 	// a channel on which the current list of active shards is sent
 	shardResults chan []*shard
 
-	// a channel that is closed when the Producer is ready to accept records
-	readyChan chan struct{}
+	// a channel on which new waiters will be transmitted
+	newIdleWaiter chan chan struct{}
 
-	// stopped is true when the Producer's Start context is cancelled
-	stopped atomic.Bool
+	// a list of waiters that wait for the [Producer] to become idle
+	idleWaiters []chan struct{}
+
+	// the number of inflight records
+	inFlightRecords int
+
+	// state is true when the Producer's Start context is cancelled
+	state *atomic.Int32
+
+	// stopped is a channel that will be closed when the Producer has stopped
+	stopped chan struct{}
 
 	// various metrics
 	meterFlushCount metric.Int64Counter
@@ -105,6 +144,7 @@ func NewProducer(client Client, streamName string, cfg *ProducerConfig) (*Produc
 		return nil, fmt.Errorf("validate config: %w", err)
 	}
 
+	// add a log message indicator that it originates from this library
 	cfg.Log = cfg.Log.With("scope", "go-kinesis")
 
 	// initialize meters
@@ -118,6 +158,9 @@ func NewProducer(client Client, streamName string, cfg *ProducerConfig) (*Produc
 		return nil, fmt.Errorf("new flush_count counter: %w", err)
 	}
 
+	var state atomic.Int32
+	state.Store(int32(producerStateUnstarted))
+
 	// initialize producer
 	p := &Producer{
 		cfg:             cfg,
@@ -126,14 +169,19 @@ func NewProducer(client Client, streamName string, cfg *ProducerConfig) (*Produc
 		shards:          make([]*shard, 0),
 		aggChan:         make(chan *dataRecord),
 		collSize:        0,
-		collChan:        make(chan *dataRecord),
 		collBuf:         make([]*dataRecord, 0, cfg.CollectionMaxCount),
+		collChan:        make(chan *dataRecord),
 		flushWg:         sync.WaitGroup{},
 		flushJobs:       make(chan *flushJob),
 		flushResults:    make(chan *flushResult, cfg.Concurrency), // buffered channel
 		flushTicker:     cfg.clock.Ticker(cfg.FlushInterval),
+		aggTicker:       cfg.clock.Ticker(cfg.FlushInterval),
 		shardResults:    make(chan []*shard),
-		readyChan:       make(chan struct{}),
+		newIdleWaiter:   make(chan chan struct{}),
+		idleWaiters:     make([]chan struct{}, 0),
+		inFlightRecords: 0,
+		state:           &state,
+		stopped:         make(chan struct{}),
 		meterFlushCount: meterFlushCount,
 		meterFlushBytes: meterFlushBytes,
 	}
@@ -146,16 +194,21 @@ func NewProducer(client Client, streamName string, cfg *ProducerConfig) (*Produc
 // existing shards. Call [Producer.Ready] to get notified when the Producer is
 // actually ready to accept events.
 func (p *Producer) Start(ctx context.Context) error {
-	if p.stopped.Load() {
+	// every public API checks the state pre-conditions
+	switch p.setState(producerStateStarting) {
+	case producerStateUnstarted:
+		// all good
+	case producerStateStarted:
+		return ErrProducerStarted
+	case producerStateStopping, producerStateStopped:
 		return ErrProducerStopped
 	}
-
-	p.cfg.Log.Info("Kinesis producer started")
 
 	// load all shards
 	shards, err := p.listShards(ctx)
 	if err != nil {
-		close(p.readyChan)
+		p.setState(producerStateStopped)
+		close(p.stopped)
 		return err
 	}
 	p.shards = shards
@@ -169,19 +222,26 @@ func (p *Producer) Start(ctx context.Context) error {
 	// start the shard watcher
 	go p.watchShards(ctx)
 
-	aggTicker := p.cfg.clock.Ticker(p.cfg.FlushInterval)
+	// mark the producer as started
+	p.setState(producerStateStarted)
 
-	p.cfg.Log.Info("Kinesis producer ready", "shards", len(p.shards))
-	close(p.readyChan)
+	// always clean up after ourselves.
+	defer p.shutdown()
 
+	// start the event loop
 	for {
+
+		if p.inFlightRecords == 0 {
+			p.notifyIdleWaiters()
+		}
+
 		select {
 		case <-ctx.Done():
-			p.shutdown()
 			return nil
-		case <-aggTicker.C:
-			nextCollection := p.collectAggregators(ctx)
-			aggTicker.Reset(nextCollection)
+		case <-p.aggTicker.C:
+			p.collectAggregators(ctx)
+		case idleWaiter := <-p.newIdleWaiter:
+			p.idleWaiters = append(p.idleWaiters, idleWaiter)
 		case newShards := <-p.shardResults:
 			p.handleNewShards(ctx, newShards)
 		case <-p.flushTicker.C:
@@ -189,6 +249,7 @@ func (p *Producer) Start(ctx context.Context) error {
 		case result := <-p.flushResults:
 			p.handleFlushResult(ctx, result)
 		case record := <-p.collChan:
+			p.inFlightRecords += 1 // increment outside of collectRecord (aggregated records would be counted twice)
 			p.collectRecord(ctx, record)
 		case record := <-p.aggChan:
 			p.aggRecord(ctx, record)
@@ -196,17 +257,20 @@ func (p *Producer) Start(ctx context.Context) error {
 	}
 }
 
-// Ready blocks until the [Producer] has requested all shards and is ready to
-// accept records.
-func (p *Producer) Ready(ctx context.Context) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-p.readyChan:
-		return nil
-	}
-}
-
+// Put puts the given data using the given partition key. This method is
+// thread-safe and will exhibit backpressure by blocking the Put in case the
+// Producer cannot keep up with transmitting the events to Kinesis. The
+// [Producer] does some local rate limit accounting and throttle the
+// transmission accordingly. Similarly, when Kinesis reports that we exceeded
+// some limit, the Producer will also throttle and retry any failed
+// transmissions.
+//
+// The context can be used to put a deadline on the Put so that if the data
+// cannot be queued within some defined deadline, you can opt out of
+// transmitting this event.
+//
+// If an unrecoverable error occurs while transmitting the data, the [Notifiee]
+// will be notified about a [Notifiee.DroppedRecord].
 func (p *Producer) Put(ctx context.Context, partitionKey string, data []byte) error {
 	rec, err := newDataRecord(partitionKey, nil, data)
 	if err != nil {
@@ -216,8 +280,30 @@ func (p *Producer) Put(ctx context.Context, partitionKey string, data []byte) er
 	return p.PutRecord(ctx, rec)
 }
 
+// PutRecord enqueues the given record for tranmission to Kinesis. This method
+// is thread-safe and will exhibit backpressure by blocking the PutRecord call
+// in case the Producer cannot keep up with transmitting the events to Kinesis.
+// The [Producer] does some local rate limit accounting and throttle the
+// transmission accordingly. Similarly, when Kinesis reports that we exceeded
+// some limit, the Producer will also throttle and retry any failed
+// transmissions.
+//
+// The context can be used to put a deadline on the enqueue operation so that if
+// the data cannot be queued within some defined deadline, you can opt out of
+// transmitting this event.
+//
+// If an unrecoverable error occurs while transmitting the data, the [Notifiee]
+// will be notified about a [Notifiee.DroppedRecord]. In there you can type cast
+// the [Record] to the original record you passed in here. The [Producer] keeps
+// a reference to the original record.
 func (p *Producer) PutRecord(ctx context.Context, record Record) error {
-	if p.stopped.Load() {
+	// verify that the producer is started
+	state := p.state.Load()
+	if state == int32(producerStateStarting) {
+		if err := p.WaitIdle(ctx); err != nil {
+			return err
+		}
+	} else if state != int32(producerStateStarted) {
 		return ErrProducerStopped
 	}
 
@@ -236,7 +322,7 @@ func (p *Producer) PutRecord(ctx context.Context, record Record) error {
 	drecord, ok := record.(*dataRecord) // if PutRecord is called by Put, this is a *dataRecord
 	if !ok {
 		var err error
-		drecord, err = newDataRecord(record.PartitionKey(), record.ExplicitHashKey(), record.Data())
+		drecord, err = newDataRecord(record.PartitionKey(), record.ExplicitHashKey(), record.Data(), record)
 		if err != nil {
 			return fmt.Errorf("new data record: %w", err)
 		}
@@ -251,6 +337,7 @@ func (p *Producer) PutRecord(ctx context.Context, record Record) error {
 		recChan = p.aggChan
 	}
 
+	// try to enqueue the record
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -259,43 +346,136 @@ func (p *Producer) PutRecord(ctx context.Context, record Record) error {
 	}
 }
 
+// WaitIdle blocks until the Producer has processed and transmitted all records.
+// After this call returns, there are no in-flight requests or pending records
+func (p *Producer) WaitIdle(ctx context.Context) error {
+	waitChan := make(chan struct{})
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-p.stopped:
+		return ErrProducerStopped
+	case p.newIdleWaiter <- waitChan:
+		// pass
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-p.stopped:
+		return ErrProducerStopped
+	case <-waitChan:
+		return nil
+	}
+}
+
+// WaitStopped blocks until the Producer has stopped and cleaned up all its
+// resources.
+func (p *Producer) WaitStopped(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-p.stopped:
+		return nil
+	}
+}
+
+func (p *Producer) notifyIdleWaiters() {
+	for _, idleWaiter := range p.idleWaiters {
+		close(idleWaiter)
+	}
+	p.idleWaiters = make([]chan struct{}, 0)
+}
+
+// handleRetry handles a failed transmission of the given record. It first
+// checks if the retry limit was exceeded and if so, notifies the [Notifiee]
+// about a dropped record. Otherwise, the record will just be enqueued again.
+// TODO: it would be even better if we enqueued it at the front.
 func (p *Producer) handleRetry(ctx context.Context, record *dataRecord) {
 	if record.retries >= p.cfg.RetryLimit {
-		// TODO: de-aggregate
-		p.cfg.Notifiee.DroppedRecord(record)
+		p.notifyDropped(record)
 	} else {
 		p.collectRecord(ctx, record)
 	}
 }
 
-func (p *Producer) shutdown() {
-	p.stopped.Store(true)
-
-	for range p.shardResults {
-		// drain shardResults
+// notifyDropped notifies the user about dropped records. This could happen
+// because the maximum number of transmission retries is succeeded or they are
+// still buffered when the producer stopped. It returns the plain [dataRecord]
+// if no user records are associated with it. This can happen if the user calls
+// Put and passes the partition key and data manually. Otherwise, it loops
+// through all user records. There could be many as an aggregated record could
+// hold multiple user records.
+func (p *Producer) notifyDropped(rec *dataRecord) {
+	// if there's no user record associated with this dataRecord,
+	// just plainly submit it.
+	if len(rec.urecs) == 0 {
+		p.inFlightRecords -= 1
+		p.cfg.Notifiee.DroppedRecord(rec)
+		return
 	}
 
+	// we have at least one user record, notify the user about the original Record
+	for _, urec := range rec.urecs {
+		// if the user record is also a [dataRecord], we unwrap it again by
+		// making a recursive call.
+		if dr, ok := urec.(*dataRecord); ok {
+			p.notifyDropped(dr)
+		} else {
+			p.inFlightRecords -= 1
+			p.cfg.Notifiee.DroppedRecord(urec)
+		}
+	}
+}
+
+// setState sets the producer state and logs the state transition
+func (p *Producer) setState(new producerState) producerState {
+	old := p.state.Swap(int32(new))
+	p.cfg.Log.Info(fmt.Sprintf("Kinesis producer %s", new.String()), "old", producerState(old).String(), "new", new.String())
+	return producerState(old)
+}
+
+func (p *Producer) shutdown() {
+	defer close(p.stopped)
+	p.setState(producerStateStopping)
+	defer p.setState(producerStateStopped)
+
+	for range p.shardResults {
+		// drain shardResults, exits the loop when shardResults was closed
+	}
+
+	// signal that there will be no new flush jobs
 	close(p.flushJobs)
+
+	// wait until the flush workers have returned
 	p.flushWg.Wait()
+
+	// close the job results channel as the workers have stopped
 	close(p.flushResults)
 
+	// since the flushResults channel is buffered ther might still be unhandled
+	// events.
 	for result := range p.flushResults {
 		if result.err != nil {
+			// if the entire request failed, notify the user about all records
 			for _, rec := range result.job.records {
-				p.cfg.Notifiee.DroppedRecord(rec)
+				p.notifyDropped(rec)
 			}
-		} else if result.out != nil {
+		} else if result.out != nil && result.out.FailedRecordCount != nil && *result.out.FailedRecordCount > 0 {
+			// if we experienced a partial failure, only notify the user about
+			// these records.
 			for i, rec := range result.out.Records {
 				if rec.ShardId != nil || rec.SequenceNumber != nil || rec.ErrorMessage == nil || rec.ErrorCode == nil {
 					continue
 				}
-				p.cfg.Notifiee.DroppedRecord(result.job.records[i])
+				p.notifyDropped(result.job.records[i])
 			}
 		}
 	}
 
 	for _, rec := range p.collBuf {
-		p.cfg.Notifiee.DroppedRecord(rec)
+		p.notifyDropped(rec)
 	}
 
 	p.drainChan(p.aggChan)
@@ -312,7 +492,7 @@ func (p *Producer) drainChan(c chan *dataRecord) {
 		select {
 		case rec, more := <-c:
 			if more {
-				p.cfg.Notifiee.DroppedRecord(rec)
+				p.notifyDropped(rec)
 			} else {
 				return
 			}
@@ -322,6 +502,10 @@ func (p *Producer) drainChan(c chan *dataRecord) {
 	}
 }
 
+// watchShards starts an infinite loop to periodically list all the shards of
+// the given data stream. The probe frequency can be configured with
+// [ProducerConfig.ShardUpdateInterval]. The returned shards are transmitted
+// back to the main loop and handled there in [handleNewShards].
 func (p *Producer) watchShards(ctx context.Context) {
 	p.cfg.Log.Debug("Started watching shards")
 	defer p.cfg.Log.Debug("Stopped watching shards")
@@ -332,6 +516,7 @@ func (p *Producer) watchShards(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			t.Stop()
 			return
 		case <-t.C:
 			// pass
@@ -347,6 +532,7 @@ func (p *Producer) watchShards(ctx context.Context) {
 	}
 }
 
+// listShards requests the currently active lists of shards from AWS Kinesis.
 func (p *Producer) listShards(ctx context.Context) ([]*shard, error) {
 	p.cfg.Log.Debug("Listing shards...")
 
@@ -405,7 +591,7 @@ type shard struct {
 	aggregator   *aggregator
 	sizeLimiter  *rate.Limiter
 	countLimiter *rate.Limiter
-	nBytes       int
+	size         int
 	count        int
 }
 
@@ -448,7 +634,7 @@ func (p *Producer) newShard(s types.Shard) (*shard, error) {
 		sizeLimiter:  rate.NewLimiter(maxShardBytesPerS, maxShardBytesPerS),
 		countLimiter: rate.NewLimiter(maxShardRecordsPerS, maxShardRecordsPerS),
 		count:        0,
-		nBytes:       0,
+		size:         0,
 	}, nil
 }
 
@@ -504,9 +690,9 @@ func (p *Producer) flushWorker(ctx context.Context, workerID string) {
 		// do the request
 		p.meterFlushCount.Add(ctx, int64(len(input.Records)), metric.WithAttributes(attribute.String("type", "sent")))
 		p.meterFlushBytes.Add(ctx, int64(job.collSize))
-		logger.Info("--> Flush records", "count", len(input.Records), "size", fmtSize(job.collSize))
+		logger.Info("Flush records", "count", len(input.Records), "size", fmtSize(job.collSize))
 		out, err := p.client.PutRecords(ctx, input)
-		logger.Info("<-- Flushed records", "count", len(input.Records), "size", fmtSize(job.collSize))
+		logger.Debug("Flushed records", "count", len(input.Records), "size", fmtSize(job.collSize))
 
 		p.flushResults <- &flushResult{
 			id:  workerID,
@@ -522,13 +708,11 @@ func (p *Producer) flush(ctx context.Context, reason string) {
 		return
 	}
 
-	p.cfg.Log.Debug("Schedule flush", "count", len(p.collBuf), "size", fmtSize(p.collSize), "reason", reason)
-
 	flushAt := p.cfg.clock.Now()
 	for i := range p.shards {
 		s := p.shards[i]
 
-		res := s.sizeLimiter.ReserveN(p.cfg.clock.Now(), s.nBytes)
+		res := s.sizeLimiter.ReserveN(p.cfg.clock.Now(), s.size)
 		if p.cfg.clock.Now().Add(res.Delay()).After(flushAt) {
 			flushAt = p.cfg.clock.Now().Add(res.Delay())
 		}
@@ -538,7 +722,7 @@ func (p *Producer) flush(ctx context.Context, reason string) {
 			flushAt = p.cfg.clock.Now().Add(res.Delay())
 		}
 
-		s.nBytes = 0
+		s.size = 0
 		s.count = 0
 	}
 
@@ -548,10 +732,11 @@ func (p *Producer) flush(ctx context.Context, reason string) {
 		flushAt:  flushAt,
 	}
 
+	p.cfg.Log.Debug("Schedule flush", "count", len(p.collBuf), "size", fmtSize(p.collSize), "reason", reason)
 	select {
 	case <-ctx.Done():
 		for _, rec := range job.records {
-			p.cfg.Notifiee.DroppedRecord(rec)
+			p.notifyDropped(rec)
 		}
 		return
 	case p.flushJobs <- job:
@@ -568,7 +753,7 @@ func (p *Producer) collectRecord(ctx context.Context, record *dataRecord) {
 	recordSize := record.Size()
 	shardIdx := p.shardIdx(record.hk)
 
-	if p.shards[shardIdx].nBytes+recordSize > maxShardBytesPerS {
+	if p.shards[shardIdx].size+recordSize > maxShardBytesPerS {
 		p.flush(ctx, "shard_size")
 	}
 
@@ -581,7 +766,7 @@ func (p *Producer) collectRecord(ctx context.Context, record *dataRecord) {
 	// do some accounting and store the new record in our buffer
 	p.collSize += recordSize
 	p.collBuf = append(p.collBuf, record)
-	p.shards[shardIdx].nBytes += recordSize
+	p.shards[shardIdx].size += recordSize
 	p.shards[shardIdx].count += 1
 
 	// check if the number of buffered records is equal to the maximum of
@@ -595,8 +780,8 @@ func (p *Producer) collectRecord(ctx context.Context, record *dataRecord) {
 	}
 }
 
-func (p *Producer) collectAggregators(ctx context.Context) time.Duration {
-	nextCollection := p.cfg.FlushInterval
+func (p *Producer) collectAggregators(ctx context.Context) {
+	nextDrain := p.cfg.FlushInterval
 
 	for _, s := range p.shards {
 		// if the last drain is longer ago than the FlushInterval -> drain it
@@ -611,11 +796,11 @@ func (p *Producer) collectAggregators(ctx context.Context) time.Duration {
 			}
 		} else if p.cfg.clock.Until(s.aggregator.lastDrain) > 0 {
 			// if the earliest next drain is in the future, keep track of it
-			nextCollection = p.cfg.clock.Until(s.aggregator.lastDrain)
+			nextDrain = p.cfg.clock.Until(s.aggregator.lastDrain)
 		}
 	}
 
-	return nextCollection
+	p.aggTicker.Reset(nextDrain)
 }
 
 func (p *Producer) aggRecord(ctx context.Context, record *dataRecord) {
@@ -646,6 +831,7 @@ func (p *Producer) aggRecord(ctx context.Context, record *dataRecord) {
 	}
 
 	// the aggregator has the capacity to carry the new record -> add it.
+	p.inFlightRecords += 1
 	agg.put(record)
 
 	// check if the aggregator carries the maximum number of records, if so -> drain it
@@ -671,7 +857,6 @@ func (p *Producer) shardIdx(hashKey *big.Int) int {
 }
 
 func (p *Producer) handleFlushResult(ctx context.Context, result *flushResult) {
-	p.cfg.Log.Info("X Handle Flush result", "success", result.out != nil)
 	if result.err != nil {
 		p.cfg.Log.Warn("Failed sending records to Kinesis", "err", result.err.Error())
 		p.meterFlushCount.Add(ctx, int64(len(result.job.records)), metric.WithAttributes(attribute.String("type", "failed")))
@@ -688,6 +873,7 @@ func (p *Producer) handleFlushResult(ctx context.Context, result *flushResult) {
 	// if we don't have something to work with or if we don't have any
 	// failed records, continue to read a new batch
 	if result.out == nil || result.out.FailedRecordCount == nil || *result.out.FailedRecordCount == 0 {
+		p.inFlightRecords -= len(result.job.records)
 		return
 	}
 
@@ -699,6 +885,7 @@ func (p *Producer) handleFlushResult(ctx context.Context, result *flushResult) {
 
 	for i, rec := range result.out.Records {
 		if rec.ShardId != nil || rec.SequenceNumber != nil || rec.ErrorMessage == nil || rec.ErrorCode == nil {
+			p.inFlightRecords -= 1
 			continue
 		}
 		retryRec := result.job.records[i]
@@ -737,7 +924,7 @@ func (p *Producer) handleNewShards(ctx context.Context, newShards []*shard) {
 		return
 	}
 
-	p.cfg.Log.Info("Observed resharding", "newShards", len(newShards))
+	p.cfg.Log.Info("Resharding", "newShards", len(newShards))
 
 	// some shards may still be the same, in that case we want to preserve
 	// the limits.

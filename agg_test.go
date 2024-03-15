@@ -35,9 +35,9 @@ func TestAggregator_put(t *testing.T) {
 	assert.Equal(t, rec1.pk, agg.keys[0])
 	assert.Equal(t, 0, agg.keysIdx[rec1.pk])
 
-	kcl, err := agg.aggregate()
+	rec, err := agg.aggregate()
 	require.NoError(t, err)
-	assert.Equal(t, len(kcl), agg.aggSize)
+	assert.Equal(t, len(rec.data), agg.aggSize)
 
 	rec2 := &dataRecord{
 		pk:   "partition_key",
@@ -55,9 +55,9 @@ func TestAggregator_put(t *testing.T) {
 	assert.Equal(t, 0, agg.keysIdx[rec1.pk])
 	assert.Equal(t, 0, agg.keysIdx[rec2.pk])
 
-	kcl, err = agg.aggregate()
+	rec, err = agg.aggregate()
 	require.NoError(t, err)
-	assert.Equal(t, len(kcl), agg.aggSize)
+	assert.Equal(t, len(rec.data), agg.aggSize)
 
 	rec3 := &dataRecord{
 		pk:   "other_key",
@@ -78,9 +78,9 @@ func TestAggregator_put(t *testing.T) {
 	assert.Equal(t, 0, agg.keysIdx[rec2.pk])
 	assert.Equal(t, 1, agg.keysIdx[rec3.pk])
 
-	kcl, err = agg.aggregate()
+	rec, err = agg.aggregate()
 	require.NoError(t, err)
-	assert.Equal(t, len(kcl), agg.aggSize)
+	assert.Equal(t, len(rec.data), agg.aggSize)
 }
 
 func TestAggregator_drain(t *testing.T) {

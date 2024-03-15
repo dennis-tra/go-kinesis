@@ -75,6 +75,7 @@ const (
 )
 
 var (
+	ErrProducerStarted     = fmt.Errorf("kinesis producer already started")
 	ErrProducerStopped     = fmt.Errorf("kinesis producer is stopped")
 	ErrRecordSizeExceeded  = fmt.Errorf("data must be less than or equal to 1MB in size")
 	ErrInvalidPartitionKey = fmt.Errorf("invalid parition key. Length must be at least 1 and at most 256")
