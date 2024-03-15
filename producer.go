@@ -348,6 +348,7 @@ func (p *Producer) PutRecord(ctx context.Context, record Record) error {
 
 // WaitIdle blocks until the Producer has processed and transmitted all records.
 // After this call returns, there are no in-flight requests or pending records
+// waiting to be transmitted.
 func (p *Producer) WaitIdle(ctx context.Context) error {
 	waitChan := make(chan struct{})
 
@@ -873,7 +874,13 @@ func (p *Producer) handleFlushResult(ctx context.Context, result *flushResult) {
 	// if we don't have something to work with or if we don't have any
 	// failed records, continue to read a new batch
 	if result.out == nil || result.out.FailedRecordCount == nil || *result.out.FailedRecordCount == 0 {
-		p.inFlightRecords -= len(result.job.records)
+		for _, rec := range result.job.records {
+			if len(rec.urecs) == 0 {
+				p.inFlightRecords -= 1
+			} else {
+				p.inFlightRecords -= len(rec.urecs) // TODO: go another level deeper?
+			}
+		}
 		return
 	}
 
@@ -885,7 +892,11 @@ func (p *Producer) handleFlushResult(ctx context.Context, result *flushResult) {
 
 	for i, rec := range result.out.Records {
 		if rec.ShardId != nil || rec.SequenceNumber != nil || rec.ErrorMessage == nil || rec.ErrorCode == nil {
-			p.inFlightRecords -= 1
+			if len(result.job.records[i].urecs) == 0 {
+				p.inFlightRecords -= 1
+			} else {
+				p.inFlightRecords -= len(result.job.records[i].urecs) // TODO: go another level deeper?
+			}
 			continue
 		}
 		retryRec := result.job.records[i]

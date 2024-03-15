@@ -72,7 +72,9 @@ func startProducer(t *testing.T, ctx context.Context, p *Producer) {
 	t.Helper()
 
 	// configure mock calls
-	p.client.(*MockClient).EXPECT().ListShards(gomock.Any(), gomock.Any()).Times(1).Return(singleShardResponse(), nil)
+	if mc, ok := p.client.(*MockClient); ok {
+		mc.EXPECT().ListShards(gomock.Any(), gomock.Any()).Times(1).Return(singleShardResponse(), nil)
+	}
 
 	// start the producer
 	producerCtx, stopProducer := context.WithCancel(ctx)
