@@ -1,28 +1,31 @@
 package kinesis
 
-import "log/slog"
+import (
+	"context"
+	"log/slog"
+)
 
 type NotifieeBundle struct {
-	DroppedRecordF func(Record)
+	DroppedRecordF func(context.Context, Record)
 }
 
 var _ Notifiee = (*NotifieeBundle)(nil)
 
-func (n *NotifieeBundle) DroppedRecord(rec Record) {
+func (n *NotifieeBundle) DroppedRecord(ctx context.Context, rec Record) {
 	if n.DroppedRecordF != nil {
-		n.DroppedRecordF(rec)
+		n.DroppedRecordF(ctx, rec)
 	}
 }
 
 type Notifiee interface {
-	DroppedRecord(rec Record)
+	DroppedRecord(ctx context.Context, rec Record)
 }
 
 type NoopNotifiee struct{}
 
 var _ Notifiee = (*NoopNotifiee)(nil)
 
-func (n *NoopNotifiee) DroppedRecord(rec Record) {}
+func (n *NoopNotifiee) DroppedRecord(ctx context.Context, rec Record) {}
 
 type LogNotifiee struct {
 	Log *slog.Logger
@@ -30,6 +33,6 @@ type LogNotifiee struct {
 
 var _ Notifiee = (*LogNotifiee)(nil)
 
-func (l *LogNotifiee) DroppedRecord(rec Record) {
+func (l *LogNotifiee) DroppedRecord(ctx context.Context, rec Record) {
 	l.Log.Warn("Dropped record", "partition", rec.PartitionKey())
 }

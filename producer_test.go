@@ -431,7 +431,7 @@ func TestProducer_notifiee_droppedRecords_collRec(t *testing.T) {
 
 	dropped := make(chan Record)
 	cfg.Notifiee = &NotifieeBundle{
-		DroppedRecordF: func(record Record) {
+		DroppedRecordF: func(ctx context.Context, record Record) {
 			dropped <- record
 			close(dropped)
 		},
@@ -477,7 +477,7 @@ func TestProducer_notifiee_droppedRecords_aggRec(t *testing.T) {
 
 	dropped := make(chan Record)
 	cfg.Notifiee = &NotifieeBundle{
-		DroppedRecordF: func(record Record) {
+		DroppedRecordF: func(ctx context.Context, record Record) {
 			dropped <- record
 			close(dropped)
 		},

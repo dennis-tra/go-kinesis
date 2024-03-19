@@ -397,7 +397,7 @@ func (p *Producer) notifyIdleWaiters() {
 // TODO: it would be even better if we enqueued it at the front.
 func (p *Producer) handleRetry(ctx context.Context, record *dataRecord) {
 	if record.retries >= p.cfg.RetryLimit {
-		p.notifyDropped(record)
+		p.notifyDropped(ctx, record)
 	} else {
 		p.collectRecord(ctx, record)
 	}
@@ -410,12 +410,12 @@ func (p *Producer) handleRetry(ctx context.Context, record *dataRecord) {
 // Put and passes the partition key and data manually. Otherwise, it loops
 // through all user records. There could be many as an aggregated record could
 // hold multiple user records.
-func (p *Producer) notifyDropped(rec *dataRecord) {
+func (p *Producer) notifyDropped(ctx context.Context, rec *dataRecord) {
 	// if there's no user record associated with this dataRecord,
 	// just plainly submit it.
 	if len(rec.urecs) == 0 {
 		p.inFlightRecords -= 1
-		p.cfg.Notifiee.DroppedRecord(rec)
+		p.cfg.Notifiee.DroppedRecord(ctx, rec)
 		return
 	}
 
@@ -424,10 +424,10 @@ func (p *Producer) notifyDropped(rec *dataRecord) {
 		// if the user record is also a [dataRecord], we unwrap it again by
 		// making a recursive call.
 		if dr, ok := urec.(*dataRecord); ok {
-			p.notifyDropped(dr)
+			p.notifyDropped(ctx, dr)
 		} else {
 			p.inFlightRecords -= 1
-			p.cfg.Notifiee.DroppedRecord(urec)
+			p.cfg.Notifiee.DroppedRecord(ctx, urec)
 		}
 	}
 }
@@ -443,6 +443,10 @@ func (p *Producer) shutdown() {
 	defer close(p.stopped)
 	p.setState(producerStateStopping)
 	defer p.setState(producerStateStopped)
+
+	// use own shutdown context
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
 	for range p.shardResults {
 		// drain shardResults, exits the loop when shardResults was closed
@@ -463,7 +467,7 @@ func (p *Producer) shutdown() {
 		if result.err != nil {
 			// if the entire request failed, notify the user about all records
 			for _, rec := range result.job.records {
-				p.notifyDropped(rec)
+				p.notifyDropped(shutdownCtx, rec)
 			}
 		} else if result.out != nil && result.out.FailedRecordCount != nil && *result.out.FailedRecordCount > 0 {
 			// if we experienced a partial failure, only notify the user about
@@ -472,17 +476,17 @@ func (p *Producer) shutdown() {
 				if rec.ShardId != nil || rec.SequenceNumber != nil || rec.ErrorMessage == nil || rec.ErrorCode == nil {
 					continue
 				}
-				p.notifyDropped(result.job.records[i])
+				p.notifyDropped(shutdownCtx, result.job.records[i])
 			}
 		}
 	}
 
 	for _, rec := range p.collBuf {
-		p.notifyDropped(rec)
+		p.notifyDropped(shutdownCtx, rec)
 	}
 
-	p.drainChan(p.aggChan)
-	p.drainChan(p.collChan)
+	p.drainChan(shutdownCtx, p.aggChan)
+	p.drainChan(shutdownCtx, p.collChan)
 
 	close(p.aggChan)
 	close(p.collChan)
@@ -490,12 +494,12 @@ func (p *Producer) shutdown() {
 
 // drainChan iterates over the given channel until its closed or there are no
 // elements to consume anymore.
-func (p *Producer) drainChan(c chan *dataRecord) {
+func (p *Producer) drainChan(ctx context.Context, c chan *dataRecord) {
 	for {
 		select {
 		case rec, more := <-c:
 			if more {
-				p.notifyDropped(rec)
+				p.notifyDropped(ctx, rec)
 			} else {
 				return
 			}
@@ -739,7 +743,7 @@ func (p *Producer) flush(ctx context.Context, reason string) {
 	select {
 	case <-ctx.Done():
 		for _, rec := range job.records {
-			p.notifyDropped(rec)
+			p.notifyDropped(ctx, rec)
 		}
 		return
 	case p.flushJobs <- job:
@@ -937,7 +941,7 @@ func (p *Producer) handleNewShards(ctx context.Context, newShards []*shard) {
 		return
 	}
 
-	p.cfg.Log.Info("Resharding", "newShards", len(newShards))
+	p.cfg.Log.Info("Resharding", "new_shards", len(newShards))
 
 	// some shards may still be the same, in that case we want to preserve
 	// the limits.
