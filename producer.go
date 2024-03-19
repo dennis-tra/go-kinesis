@@ -211,6 +211,8 @@ func (p *Producer) Start(ctx context.Context) error {
 		close(p.stopped)
 		return err
 	}
+
+	p.cfg.Log.Info(fmt.Sprintf("Found %d shards", len(shards)))
 	p.shards = shards
 
 	// start the workers to flush the records to Kinesis
