@@ -1,3 +1,4 @@
+syntax = "proto2";
 package producer;
 option go_package = "github.com/dennis-tra/go-kinesis/pb";
 
